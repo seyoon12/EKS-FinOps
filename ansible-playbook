@@ -1,0 +1,85 @@
+---
+- name: Install Kubecost using Helm
+  hosts: worker
+  tasks:
+    - name: set update
+      shell: yum update -y
+      become: yes
+
+- name: Install Kubecost using Helm
+  hosts: localhost
+  gather_facts: false
+  vars:
+    eks_cluster_name: kubernetes
+    irsa_role_arn: "{{ lookup('pipe', 'terraform output -raw -state=/terraform/terraform/stacks/eks-selfmanaged-node/terraform.tfstate kubecost_irsa_role_arn') }}"
+    ebs_irsa_role_arn: "{{ lookup('pipe', 'terraform output -raw -state=/terraform/terraform/stacks/eks-selfmanaged-node/terraform.tfstate ebs_csi_irsa_role_arn') }}"
+    helm_repo_name: kubecost
+    helm_repo_url: https://kubecost.github.io/cost-analyzer/
+    release_name: kubecost
+    kubecost_namespace: kubecost
+    chart_name: kubecost/cost-analyzer
+    aws_region: ap-northeast-2
+    s3_bucket_name: finops-cost-reports
+    s3_data_prefix: kubecost-report/
+
+  tasks:
+    - name: Add EBS CSI Helm repo
+      community.kubernetes.helm_repository:
+        name: aws-ebs-csi-driver
+        repo_url: https://kubernetes-sigs.github.io/aws-ebs-csi-driver
+
+    - name: Associate OIDC provider with IAM for EKS
+      shell: |
+        eksctl utils associate-iam-oidc-provider \
+          --region {{ aws_region }} \
+          --cluster {{ eks_cluster_name }} \
+          --approve
+      register: oidc_output
+
+    - name: Create ebs-csi-controller ServiceAccount with IRSA
+      shell: |
+        kubectl get serviceaccount ebs-csi-controller-sa -n kube-system || \
+        kubectl create serviceaccount ebs-csi-controller-sa -n kube-system && \
+        kubectl annotate serviceaccount ebs-csi-controller-sa -n kube-system eks.amazonaws.com/role-arn={{ ebs_irsa_role_arn }} --overwrite
+
+    - name: Install EBS CSI Driver
+      community.kubernetes.helm:
+        name: aws-ebs-csi-driver
+        chart_ref: aws-ebs-csi-driver/aws-ebs-csi-driver
+        release_namespace: kube-system
+        create_namespace: false
+        values:
+          controller:
+            serviceAccount:
+              create: false
+              name: ebs-csi-controller-sa
+
+    - name: Add Kubecost Helm repo
+      community.kubernetes.helm_repository:
+        name: "{{ helm_repo_name }}"
+        repo_url: "{{ helm_repo_url }}"
+
+    - name: Create namespace if not exists
+      shell: |
+        kubectl get namespace {{ kubecost_namespace }} || kubectl create namespace {{ kubecost_namespace }}
+
+    - name: Install Kubecost via Helm
+      community.kubernetes.helm:
+        name: "{{ release_name }}"
+        chart_ref: "{{ chart_name }}"
+        release_namespace: "{{ kubecost_namespace }}"
+        create_namespace: false
+        values:
+          global:
+            awsRegion: "{{ aws_region }}"
+            podAnnotations:
+              iam.amazonaws.com/role: "{{ irsa_role_arn }}"
+          kubecostModel:
+            cloudAssetDestination:
+              bucket: "{{ s3_bucket_name }}"
+              region: "{{ aws_region }}"
+              prefix: "{{ s3_data_prefix }}"
+          service:
+            type: NodePort
+            port: 9090
+            nodePort: 30099
